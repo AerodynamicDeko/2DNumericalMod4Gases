@@ -1,0 +1,608 @@
+import tkinter as tk
+from tkinter import filedialog, simpledialog
+import pandas as pd
+import numpy as np
+from scipy.spatial import Delaunay
+import matplotlib.pyplot as plt
+import math
+
+###############################################################################
+# 1) Seleção e carregamento dos pontos (Excel)
+###############################################################################
+def selecionar_excel():
+    """Abre uma janela para selecionar o arquivo Excel com os pontos."""
+    root = tk.Tk()
+    root.withdraw()
+    caminho_arquivo = filedialog.askopenfilename(
+        title="Selecione o arquivo Excel com os pontos",
+        filetypes=[("Arquivos Excel", "*.xlsx")]
+    )
+    root.destroy()
+    return caminho_arquivo
+
+def carregar_pontos_excel(caminho_excel):
+    """Carrega os pontos (X, Y) do arquivo Excel usando o engine openpyxl."""
+    df = pd.read_excel(caminho_excel, engine='openpyxl')
+    pontos = df.iloc[:, :2].values
+    return pontos
+
+###############################################################################
+# 2) Geração da malha e construção das células
+###############################################################################
+def gerar_malha_delaunay(pontos):
+    """Gera a triangulação de Delaunay a partir dos pontos."""
+    tri = Delaunay(pontos)
+    triangulos = tri.simplices
+    return triangulos, tri
+
+def montar_celulas(pontos, triangulos):
+    """
+    Para cada triângulo (célula), calcula:
+      - O centróide (onde as variáveis serão armazenadas)
+      - A área da célula
+      - Os centros das arestas (para reconstrução)
+      - As normais das arestas (com magnitude igual ao comprimento)
+      - Os vizinhos (índice do triângulo vizinho para cada aresta; -1 se for fronteira)
+    """
+    num_cel = len(triangulos)
+    centroides = np.zeros((num_cel, 2))
+    areas = np.zeros(num_cel)
+    normals = np.zeros((num_cel, 3, 2))
+    face_centers = np.zeros((num_cel, 3, 2))
+    neighbor = np.full((num_cel, 3), -1, dtype=int)
+
+# usar a fórmula vetorial do centroide
+
+    for i in range(num_cel):
+        v0, v1, v2 = triangulos[i]
+        x0, y0 = pontos[v0]
+        x1, y1 = pontos[v1]
+        x2, y2 = pontos[v2]
+        centroides[i] = [(x0+x1+x2)/3.0, (y0+y1+y2)/3.0]
+        areas[i] = abs(x0*(y1-y2) + x1*(y2-y0) + x2*(y0-y1)) / 2.0
+        
+        face_centers[i,0] = [(x0+x1)/2.0, (y0+y1)/2.0]
+        face_centers[i,1] = [(x1+x2)/2.0, (y1+y2)/2.0]
+        face_centers[i,2] = [(x2+x0)/2.0, (y2+y0)/2.0]
+        
+        edges = [(x1-x0, y1-y0), (x2-x1, y2-y1), (x0-x2, y0-y2)]
+        for k in range(3):
+            ex, ey = edges[k]
+            # Vetor normal "bruto" (usando (-ey, ex)); a magnitude já é o comprimento da aresta.
+            nx = -ey
+            ny = ex
+            length = math.sqrt(nx*nx + ny*ny)
+            if length > 1e-14:
+                normals[i, k] = [nx, ny]
+            else:
+                normals[i, k] = [0.0, 0.0]
+    
+    # Mapeia arestas para identificar vizinhos
+    arestas_dict = {}
+    for i in range(num_cel):
+        v = triangulos[i]
+        for k in range(3):
+            vA = v[k]
+            vB = v[(k+1)%3]
+            edge = (min(vA, vB), max(vA, vB))
+            if edge not in arestas_dict:
+                arestas_dict[edge] = [(i, k)]
+            else:
+                arestas_dict[edge].append((i, k))
+    for edge, infos in arestas_dict.items():
+        if len(infos) == 2:
+            (i1, k1), (i2, k2) = infos
+            neighbor[i1, k1] = i2
+            neighbor[i2, k2] = i1
+
+    celulas = {
+        "centroides": centroides,
+        "areas": areas,
+        "normals": normals,
+        "neighbor": neighbor,
+        "face_centers": face_centers
+    }
+    return celulas
+
+###############################################################################
+# 3) Conversão entre variáveis conservativas e primitivas e fluxo físico
+###############################################################################
+def conserv_to_primitive(U, gamma):
+    """Converte U = [rho, rho*u, rho*v, E] para [rho, u, v, P]."""
+    rho = U[0]
+    u = U[1] / rho
+    v = U[2] / rho
+    P = (gamma - 1.0) * (U[3] - 0.5 * rho * (u*u + v*v))
+    return np.array([rho, u, v, P])
+
+def primitive_to_conserv(W, gamma):
+    """Converte W = [rho, u, v, P] para U = [rho, rho*u, rho*v, E]."""
+    rho, u, v, P = W
+    E = P/(gamma - 1.0) + 0.5 * rho * (u*u + v*v)
+    return np.array([rho, rho*u, rho*v, E])
+
+def flux_fisico(U, nxu, nyu, gamma):
+    """
+    Calcula o fluxo físico projetado na direção da normal unitária (nxu, nyu)
+    para o estado U.
+    """
+    W = conserv_to_primitive(U, gamma)
+    rho, u, v, P = W
+    un = u*nxu + v*nyu
+    flux = np.zeros(4)
+    flux[0] = rho*un
+    flux[1] = rho*u*un + P*nxu
+    flux[2] = rho*v*un + P*nyu
+    flux[3] = (U[3] + P)*un
+    return flux
+
+###############################################################################
+# 4) Reconstrução MUSCL e cálculo de gradientes (mínimos quadrados ponderados) com limitador
+###############################################################################
+
+# aplicar um método mais otimizado
+
+def compute_cell_gradients(U, celulas, triangulos, neighbor):
+    """
+    Calcula os gradientes das variáveis conservativas em cada célula usando
+    mínimos quadrados ponderados. Retorna um array de dimensão (num_cel, 4, 2):
+    para cada célula e para cada componente de U, [grad_x, grad_y].
+    """
+    num_cel = len(triangulos)
+    grad = np.zeros((num_cel, 4, 2))
+    centroids = celulas["centroides"]
+
+    for i in range(num_cel):
+        A_list = []
+        b_list = []
+        for k in range(3):
+            j = neighbor[i, k]
+            if j == -1:
+                continue
+            dx = centroids[j, 0] - centroids[i, 0]
+            dy = centroids[j, 1] - centroids[i, 1]
+            # Peso inversamente proporcional à distância ao quadrado
+            d2 = dx * dx + dy * dy
+            eps = 1e-14
+            w = 1.0 / (d2 + eps)
+            A_list.append([np.sqrt(w) * dx, np.sqrt(w) * dy])
+            b_list.append(np.sqrt(w) * (U[j] - U[i]))  # Diferença vetorial (4 componentes)
+        A = np.array(A_list)  # Shape: (n_vizinhos, 2)
+        b = np.array(b_list)  # Shape: (n_vizinhos, 4)
+        if A.shape[0] >= 2:
+            sol, residuals, rank, s = np.linalg.lstsq(A, b, rcond=None)
+            grad[i, :, :] = sol.T
+    return grad
+
+def apply_limiter(U, centroids, gradients, neighbor, triangulos):
+    """
+    Aplica o limitador de Venkatakrishnan aos gradientes calculados para evitar
+    oscilações não físicas. Para cada célula e cada componente, o gradiente é
+    reduzido por um fator theta calculado com base na comparação entre a variação
+    real (diferença entre células vizinhas) e a variação reconstruída.
+    """
+    num_cel = len(triangulos)
+    limited_grad = gradients.copy()
+    eps = 1e-14
+
+    for i in range(num_cel):
+        for comp in range(4):
+            Q_i = U[i, comp]
+            # Determina Q_max e Q_min entre a célula e seus vizinhos
+            Q_max = Q_i
+            Q_min = Q_i
+            for k in range(3):
+                j = neighbor[i, k]
+                if j == -1:
+                    continue
+                Q_j = U[j, comp]
+                Q_max = max(Q_max, Q_j)
+                Q_min = min(Q_min, Q_j)
+            
+            theta = 1.0
+            # Para cada face, calcula o valor reconstruído e o fator limiter
+            for k in range(3):
+                j = neighbor[i, k]
+                if j == -1:
+                    continue
+                delta = centroids[j] - centroids[i]
+                # Reconstrução linear: diferença estimada
+                dq = gradients[i, comp, 0] * delta[0] + gradients[i, comp, 1] * delta[1]
+                # Se dq é positivo, compara com Q_max; se negativo, com Q_min.
+                if dq > eps:
+                    r = (Q_max - Q_i) / (dq + eps)
+                elif dq < -eps:
+                    r = (Q_min - Q_i) / (dq - eps)
+                else:
+                    r = 1.0
+                # Função limiter de Venkatakrishnan:
+                phi = (r * r + 2.0 * r) / (r * r + r + 2.0)
+                theta = min(theta, phi)
+            limited_grad[i, comp, :] *= theta
+    return limited_grad
+
+def reconstruct_state(U_cell, grad_U, delta):
+    """
+    Reconstrói o estado na face usando a aproximação linear:
+       U_recon = U_cell + grad_U · delta.
+    delta é o vetor (face_center - centroid).
+    """
+    return U_cell + np.dot(grad_U, delta)
+
+###############################################################################
+# 5) Solver HLLC (mais robusto) para as equações de Euler 2D
+###############################################################################
+def hllc_flux(UL, UR, nx, ny, gamma):
+    """
+    Calcula o fluxo numérico na interface entre duas células usando o solver HLLC.
+    UL e UR são os estados conservativos (reconstruídos) à esquerda e direita.
+    (nx, ny) é o vetor normal da face (não necessariamente unitário).
+    """
+    WL = conserv_to_primitive(UL, gamma)
+    WR = conserv_to_primitive(UR, gamma)
+    rhoL, uL, vL, pL = WL
+    rhoR, uR, vR, pR = WR
+
+    # Força valores mínimos para estabilidade
+    rhoL = max(rhoL, 1e-7)
+    rhoR = max(rhoR, 1e-7)
+    pL = max(pL, 1e-7)
+    pR = max(pR, 1e-7)
+
+    mag_n = math.sqrt(nx*nx + ny*ny)
+    if mag_n < 1e-7:
+        return np.zeros(4)
+    nxu = nx / mag_n
+    nyu = ny / mag_n
+
+    unL = uL*nxu + vL*nyu
+    unR = uR*nxu + vR*nyu
+
+    aL = math.sqrt(gamma * pL / rhoL)
+    aR = math.sqrt(gamma * pR / rhoR)
+
+    SL = min(unL - aL, unR - aR)
+    SR = max(unL + aL, unR + aR)
+
+    FL = flux_fisico(UL, nxu, nyu, gamma)
+    FR = flux_fisico(UR, nxu, nyu, gamma)
+
+    if SL >= 0:
+        return FL * mag_n
+    elif SR <= 0:
+        return FR * mag_n
+    else:
+        numerator = pR - pL + rhoL*unL*(SL - unL) - rhoR*unR*(SR - unR)
+        denominator = rhoL*(SL - unL) - rhoR*(SR - unR) + 1e-7
+        S_star = numerator / denominator
+
+        # Estados intermediários
+        rho_starL = rhoL * (SL - unL) / (SL - S_star + 1e-7)
+        UL_star = UL.copy()
+        UL_star[0] = rho_starL
+        UL_star[1] = rho_starL * (uL + (S_star - unL)*nxu)
+        UL_star[2] = rho_starL * (vL + (S_star - unL)*nyu)
+        UL_star[3] = UL[3] + (S_star - unL) * (rho_starL*(S_star + pL/(rhoL*(SL - unL + 1e-7))) - UL[1])
+        
+        rho_starR = rhoR * (SR - unR) / (SR - S_star + 1e-7)
+        UR_star = UR.copy()
+        UR_star[0] = rho_starR
+        UR_star[1] = rho_starR * (uR + (S_star - unR)*nxu)
+        UR_star[2] = rho_starR * (vR + (S_star - unR)*nyu)
+        UR_star[3] = UR[3] + (S_star - unR) * (rho_starR*(S_star + pR/(rhoR*(SR - unR + 1e-7))) - UR[1])
+        
+        if S_star >= 0:
+            flux = FL + SL*(UL_star - UL)
+        else:
+            flux = FR + SR*(UR_star - UR)
+        return flux * mag_n
+
+###############################################################################
+# 6) Identificação e Aplicação de Condições de Contorno (BC)
+###############################################################################
+def classify_boundary_face(face_center, min_x, max_x, min_y, max_y, tol=1e-6):
+    """
+    Classifica a aresta de fronteira de acordo com sua posição:
+      - Se x ~ min_x => inflow
+      - Se x ~ max_x => outflow
+      - Se y ~ min_y ou y ~ max_y => wall
+      - Caso contrário, retornamos 'internal' (ou 'wall', dependendo da sua convenção).
+    """
+    x, y = face_center
+
+    if abs(x - min_x) < tol:
+        return "inflow"
+    elif abs(x - max_x) < tol:
+        return "outflow"
+    elif abs(y - min_y) < tol or abs(y - max_y) < tol:
+        return "wall"
+    else:
+        # Se preferir, pode retornar 'wall' aqui também.
+        return "internal"
+
+def apply_boundary_condition(UL, bc_type, gamma, inflow_state, P_out, nx, ny):
+    """
+    Aplica a condição de contorno apropriada de acordo com bc_type:
+      - internal: face não é de fato fronteira => retorna UL inalterado
+      - inflow: estado fixo = inflow_state (fornecido pelo usuário)
+      - outflow: subsonic => fixa pressão P_out; supersonic => copia do interior
+      - wall: reflexivo com velocidade normal zero
+    """
+    # Copiamos o estado interno como base
+    UR = UL.copy()
+    W_in = conserv_to_primitive(inflow_state, gamma)  # Estado primitivo inflow
+    W_L  = conserv_to_primitive(UL, gamma)            # Estado primitivo interno
+
+    # Normal unitária
+    mag_n = math.sqrt(nx*nx + ny*ny)
+    if mag_n < 1e-14:
+        # Se a normal for praticamente nula, não fazemos alteração
+        return UR
+    
+    nxu = nx / mag_n
+    nyu = ny / mag_n
+
+    # 1) Se a face não é fronteira, não alteramos nada
+    if bc_type == "internal":
+        return UL
+
+    # 2) Inflow: impõe o estado de entrada (ex.: velocidade e pressão fixas)
+    if bc_type == "inflow":
+        UR = inflow_state
+
+    # 3) Outflow: diferenciamos sub-sônico de super-sônico
+    elif bc_type == "outflow":
+        rhoL, uL, vL, pL = W_L
+        unL = uL*nxu + vL*nyu
+        aL  = math.sqrt(gamma * pL / (rhoL + 1e-14))
+
+        # Critério simples:
+        #   |unL| < aL => sub-sônico => fixa pressão
+        #   |unL| >= aL => super-sônico => copia estado interno
+        if abs(unL) < aL:
+            # Subsonic => ajusta pressão
+            # Copia as outras variáveis do estado interno
+            W_out = np.array([rhoL, uL, vL, P_out])
+            UR = primitive_to_conserv(W_out, gamma)
+        else:
+            # Supersonic => simplesmente copia o estado interno
+            UR = UL
+
+    # 4) Wall (parede): velocidade normal zero
+    elif bc_type == "wall":
+        prim = W_L.copy()  # [rho, u, v, P]
+        un = prim[1]*nxu + prim[2]*nyu
+        # Remove a componente normal
+        prim[1] -= un * nxu
+        prim[2] -= un * nyu
+        UR = primitive_to_conserv(prim, gamma)
+
+    return UR
+
+###############################################################################
+# 7) Loop principal da simulação – integração temporal RK2 com BC inflow/outflow
+###############################################################################
+def simular_euler_2D(
+    celulas, triangulos,
+    # Parâmetros iniciais
+    T0, P0, rho0, u0, v0,
+    # BC
+    P_out,
+    gamma, CFL, max_iter,
+    min_x, max_x, min_y, max_y
+):
+    """
+    Solver 2D para as equações de Euler em malha não estruturada.
+    Utiliza reconstrução MUSCL de 2ª ordem com cálculo de gradientes via mínimos quadrados (com limitador),
+    solver HLLC e integração temporal RK2.
+    
+    Agora com:
+      - inflow: estado inicial (rho0, u0, v0, P0) fixo
+      - outflow: subsonic => fixa P_out, supersonic => copia interior
+      - walls: reflexivo com velocidade normal zero
+    """
+    num_cel = len(triangulos)
+    R = 287.0  # Constante do gás (J/kg.K)
+
+    # Se o usuário não forneceu densidade, podemos calcular via P0/(R*T0),
+    # mas aqui supomos que ele já forneceu.
+    E0 = P0/(gamma-1.0) + 0.5 * rho0 * (u0*u0+v0*v0)
+    
+    # Estado inflow (conservativo)
+    inflow_primitive = np.array([rho0, u0, v0, P0])
+    inflow_state = primitive_to_conserv(inflow_primitive, gamma)
+
+    # Inicializa o estado conservativo U em cada célula
+    U = np.zeros((num_cel, 4))
+    for i in range(num_cel):
+        U[i] = inflow_state
+        
+    centroids = celulas["centroides"]
+    areas = celulas["areas"]
+    neighbor = celulas["neighbor"]
+    normals = celulas["normals"]
+    face_centers = celulas["face_centers"]
+
+    for it in range(max_iter):
+        # Cálculo do passo de tempo global (dt) baseado em CFL
+        dt_min = 1e20
+        for i in range(num_cel):
+            W = conserv_to_primitive(U[i], gamma)
+            rho, u, v, P = W
+            rho = max(rho, 1e-14)
+            P = max(P, 1e-14)
+            a = math.sqrt(gamma * P / rho)
+            vel = math.sqrt(u*u+v*v) + a
+            h = math.sqrt(areas[i])
+            dt_cell = CFL * h / (vel + 1e-14)
+            dt_min = min(dt_min, dt_cell)
+        dt = dt_min
+
+        # Reconstrução MUSCL: cálculo dos gradientes com mínimos quadrados
+        gradients = compute_cell_gradients(U, celulas, triangulos, neighbor)
+        gradients = apply_limiter(U, centroids, gradients, neighbor, triangulos)
+
+        dU = np.zeros_like(U)
+        # Loop sobre cada célula e cada face para computar os fluxos
+        for i in range(num_cel):
+            for k in range(3):
+                j = neighbor[i, k]
+                nx = normals[i, k, 0]
+                ny = normals[i, k, 1]
+                face_center = face_centers[i, k]
+                delta_i = face_center - centroids[i]
+                UL_recon = reconstruct_state(U[i], gradients[i], delta_i)
+
+                if j != -1:
+                    # Face interna: flux entre células i e j
+                    delta_j = face_center - centroids[j]
+                    UR_recon = reconstruct_state(U[j], gradients[j], delta_j)
+                else:
+                    # Face de fronteira: classificar BC
+                    bc_type = classify_boundary_face(face_center, min_x, max_x, min_y, max_y)
+                    UR_recon = apply_boundary_condition(
+                        UL_recon, bc_type, gamma, inflow_state, P_out, nx, ny
+                    )
+
+                flux = hllc_flux(UL_recon, UR_recon, nx, ny, gamma)
+                dU[i] -= flux
+                if j != -1:
+                    dU[j] += flux
+
+        # Atualização RK2 – primeiro estágio
+        U1 = U + (dt/areas[:, None]) * dU
+
+        gradients1 = compute_cell_gradients(U1, celulas, triangulos, neighbor)
+        gradients1 = apply_limiter(U1, centroids, gradients1, neighbor, triangulos)
+        dU1 = np.zeros_like(U1)
+        for i in range(num_cel):
+            for k in range(3):
+                j = neighbor[i, k]
+                nx = normals[i, k, 0]
+                ny = normals[i, k, 1]
+                face_center = face_centers[i, k]
+                delta_i = face_center - centroids[i]
+                UL_recon = reconstruct_state(U1[i], gradients1[i], delta_i)
+
+                if j != -1:
+                    delta_j = face_center - centroids[j]
+                    UR_recon = reconstruct_state(U1[j], gradients1[j], delta_j)
+                else:
+                    bc_type = classify_boundary_face(face_center, min_x, max_x, min_y, max_y)
+                    UR_recon = apply_boundary_condition(
+                        UL_recon, bc_type, gamma, inflow_state, P_out, nx, ny
+                    )
+
+                flux = hllc_flux(UL_recon, UR_recon, nx, ny, gamma)
+                dU1[i] -= flux
+                if j != -1:
+                    dU1[j] += flux
+
+        U = 0.5*(U + U1 + (dt/areas[:, None])*dU1)
+
+        if it % 10 == 0:
+            print(f"Iteração {it}, dt = {dt:.3e}")
+            
+    return U, centroids, celulas
+
+###############################################################################
+# 8) Módulo para solicitar os parâmetros ao usuário
+###############################################################################
+def pedir_parametros_simulacao():
+    """
+    Abre janelas de diálogo para solicitar:
+      - Temperatura inicial (K)
+      - Pressão inicial (Pa)
+      - Densidade inicial (kg/m³)
+      - Velocidade inicial em x (m/s)
+      - Velocidade inicial em y (m/s)
+      - Pressão de saída (Pa) [subsonic outflow]
+      - Gamma
+      - CFL
+      - Número de iterações
+      - min_x, max_x, min_y, max_y (para classificar BC)
+    """
+    root = tk.Tk()
+    root.withdraw()
+    T0 = simpledialog.askfloat("Parâmetros", "Temperatura inicial (K):", initialvalue=300)
+    P0 = simpledialog.askfloat("Parâmetros", "Pressão inicial (Pa):", initialvalue=101325)
+    rho0 = simpledialog.askfloat("Parâmetros", "Densidade inicial (kg/m³):", initialvalue=1.18)
+    u0 = simpledialog.askfloat("Parâmetros", "Velocidade inicial em x (m/s):", initialvalue=600)
+    v0 = simpledialog.askfloat("Parâmetros", "Velocidade inicial em y (m/s):", initialvalue=0)
+    P_out = simpledialog.askfloat("Parâmetros", "Pressão de saída (Pa):", initialvalue=101325)
+    gamma = simpledialog.askfloat("Parâmetros", "Valor de gamma:", initialvalue=1.4)
+    CFL = simpledialog.askfloat("Parâmetros", "Número CFL:", initialvalue=0.3)
+    max_iter = simpledialog.askinteger("Parâmetros", "Número de iterações:", initialvalue=100)
+    
+    # Para classificar as fronteiras, precisamos de bounding box:
+    min_x = simpledialog.askfloat("Domínio", "Coordenada x mínima do domínio:", initialvalue=0.0)
+    max_x = simpledialog.askfloat("Domínio", "Coordenada x máxima do domínio:", initialvalue=50.0)
+    min_y = simpledialog.askfloat("Domínio", "Coordenada y mínima do domínio:", initialvalue=0.0)
+    max_y = simpledialog.askfloat("Domínio", "Coordenada y máxima do domínio:", initialvalue=50.0)
+
+    root.destroy()
+    return T0, P0, rho0, u0, v0, P_out, gamma, CFL, max_iter, min_x, max_x, min_y, max_y
+
+###############################################################################
+# 9) Função principal (main)
+###############################################################################
+def main():
+    # Seleciona o arquivo Excel com pontos
+    caminho_excel = selecionar_excel()
+    if not caminho_excel:
+        print("Nenhum arquivo selecionado. Encerrando.")
+        return
+    print(f"Arquivo selecionado: {caminho_excel}")
+    
+    # Carrega pontos e gera malha
+    pontos = carregar_pontos_excel(caminho_excel)
+    print(f"Pontos carregados: {len(pontos)} pontos encontrados.")
+    
+    triangulos, _ = gerar_malha_delaunay(pontos)
+    print(f"Triângulos gerados: {len(triangulos)}.")
+    
+    celulas = montar_celulas(pontos, triangulos)
+    
+    # Solicita parâmetros da simulação
+    (T0, P0, rho0, u0, v0, P_out,
+     gamma, CFL, max_iter,
+     min_x, max_x, min_y, max_y) = pedir_parametros_simulacao()
+
+    # Executa a simulação com BC inflow/outflow/wall
+    U_final, centroids, celulas = simular_euler_2D(
+        celulas, triangulos,
+        T0, P0, rho0, u0, v0,
+        P_out,
+        gamma, CFL, max_iter,
+        min_x, max_x, min_y, max_y
+    )
+    print("Simulação concluída!")
+    
+    # Converte estados finais para variáveis primitivas para visualização
+    num_cel = len(triangulos)
+    W_final = np.zeros((num_cel, 4))
+    for i in range(num_cel):
+        W_final[i] = conserv_to_primitive(U_final[i], gamma)
+    rho = W_final[:,0]
+    u = W_final[:,1]
+    v = W_final[:,2]
+    P = W_final[:,3]
+    vel = np.sqrt(u*u + v*v)
+    T = P/(rho*287.0)
+
+    # Plot usando os centróides das células
+    fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+    sc0 = axs[0].scatter(centroids[:,0], centroids[:,1], c=rho, cmap='viridis')
+    axs[0].set_title("Densidade (kg/m³)")
+    plt.colorbar(sc0, ax=axs[0])
+    sc1 = axs[1].scatter(centroids[:,0], centroids[:,1], c=vel, cmap='plasma')
+    axs[1].set_title("Velocidade (m/s)")
+    plt.colorbar(sc1, ax=axs[1])
+    sc2 = axs[2].scatter(centroids[:,0], centroids[:,1], c=T, cmap='inferno')
+    axs[2].set_title("Temperatura (K)")
+    plt.colorbar(sc2, ax=axs[2])
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
